@@ -1,0 +1,91 @@
+name: Render Cartoon Episode
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: 'Arabic narration text'
+        required: true
+      scene_prompts:
+        description: 'JSON array of English image prompts'
+        required: true
+      voice:
+        description: 'edge-tts voice'
+        required: false
+        default: 'ar-SA-HamedNeural'
+      episode_tag:
+        description: 'Unique release tag for this episode'
+        required: true
+      resumeUrl:
+        description: 'n8n resume URL (added automatically by n8n)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg jq
+          pip install edge-tts
+
+      - name: Generate voiceover
+        env:
+          SCRIPT: ${{ inputs.script }}
+          VOICE: ${{ inputs.voice }}
+        run: |
+          printf '%s' "$SCRIPT" > script.txt
+          edge-tts --voice "$VOICE" --file script.txt --write-media voice.mp3
+
+      - name: Generate cartoon scenes
+        env:
+          PROMPTS: ${{ inputs.scene_prompts }}
+        run: |
+          i=0
+          echo "$PROMPTS" | jq -r '.[]' | while IFS= read -r p; do
+            i=$((i+1))
+            enc=$(jq -rn --arg s "$p, 2D cartoon for kids, vibrant colors, clean lines, vertical composition" '$s|@uri')
+            out=$(printf 'img_%02d.jpg' "$i")
+            for try in 1 2 3 4; do
+              if curl -sfL --max-time 180 -o "$out" "https://image.pollinations.ai/prompt/${enc}?width=1080&height=1920&nologo=true&seed=$i"; then break; fi
+              sleep 20
+            done
+            sleep 8
+          done
+          ls -la img_*.jpg
+
+      - name: Render vertical video
+        run: |
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice.mp3)
+          N=$(ls img_*.jpg | wc -l)
+          FR=$(python3 -c "import math;print(math.ceil(($DUR/$N+0.1)*30))")
+          n=0
+          for f in img_*.jpg; do
+            n=$((n+1))
+            ffmpeg -y -i "$f" -vf "scale=1188:2112,zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$FR:s=1080x1920:fps=30,format=yuv420p" -frames:v "$FR" -c:v libx264 -preset veryfast "seg_$n.mp4"
+            echo "file 'seg_$n.mp4'" >> list.txt
+          done
+          ffmpeg -y -f concat -safe 0 -i list.txt -i voice.mp3 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart episode.mp4
+
+      - name: Publish video and notify n8n
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.episode_tag }}
+          RESUME: ${{ inputs.resumeUrl }}
+        run: |
+          gh release create "$TAG" episode.mp4 --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Rendered episode"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/episode.mp4"
+          curl -sf -X POST -H 'Content-Type: application/json' -d "$(jq -n --arg u "$URL" '{status:"success",videoUrl:$u}')" "$RESUME"
+
+      - name: Notify n8n of failure
+        if: failure()
+        env:
+          RESUME: ${{ inputs.resumeUrl }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST -H 'Content-Type: application/json' -d "$(jq -n --arg r "$RUN_URL" '{status:"failure",runUrl:$r}')" "$RESUME"
